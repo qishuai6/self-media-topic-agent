@@ -1,0 +1,4 @@
+interface:
+  display_name: "自媒体选题 Agent"
+  short_description: "抓爆款样本、融合个人内容并生成选题与初稿"
+  default_prompt: "Use $self-media-topic-agent to analyze a content direction, pull viral samples, and turn my own content into topic ideas and a first draft."
