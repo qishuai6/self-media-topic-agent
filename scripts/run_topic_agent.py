@@ -10,32 +10,50 @@ import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
 USER_AGENT = "self-media-topic-agent/0.1 (+Codex skill)"
 TEXT_EXTENSIONS = {".md", ".markdown", ".txt"}
+NOISE_KEYWORDS = {
+    "小红书": ["闺蜜", "放假", "婚戒", "哈哈", "追剧", "腹肌奶茶", "穿搭", "沉香如屑", "氛围感", "恋爱", "宝宝"],
+    "抖音": ["旅行", "穿搭", "世界杯", "婚礼", "大学生", "美食", "功夫女足", "溪降"],
+}
 PLATFORM_PRESETS = {
     "xiaohongshu": {
         "label": "小红书",
-        "query_suffix": "小红书 爆款 OR 收藏 OR 评论",
+        "discovery": "xiaohongshu",
+        "site_hint": "site:xiaohongshu.com/explore",
+        "query_suffix": "小红书 爆款 收藏 评论",
+    },
+    "douyin": {
+        "label": "抖音",
+        "discovery": "douyin",
+        "site_hint": "site:douyin.com",
+        "query_suffix": "抖音 爆款 热门 点赞",
     },
     "bilibili": {
         "label": "B站",
-        "query_suffix": "B站 热门 OR 爆款 OR 高播放",
+        "discovery": "sogou",
+        "site_hint": "site:bilibili.com/video",
+        "query_suffix": "B站 热门 爆款 高播放",
     },
     "zhihu": {
         "label": "知乎",
-        "query_suffix": "知乎 高赞 OR 热门",
+        "discovery": "sogou",
+        "site_hint": "site:zhihu.com",
+        "query_suffix": "知乎 高赞 热门",
     },
     "weixin": {
         "label": "公众号",
-        "query_suffix": "公众号 爆文 OR 阅读",
+        "discovery": "sogou",
+        "site_hint": "site:mp.weixin.qq.com",
+        "query_suffix": "公众号 爆文 阅读",
     },
     "web": {
-        "label": "通用网页",
-        "query_suffix": "趋势 OR 热门 OR 爆款",
+        "label": "中文网页",
+        "discovery": "sogou",
+        "query_suffix": "案例 教程 趋势 热门",
     },
 }
 
@@ -89,7 +107,7 @@ def parse_args():
     parser.add_argument("--content-dir", action="append", default=[], help="Folder containing markdown/text content.")
     parser.add_argument("--content-file", action="append", default=[], help="Single markdown/text file to import.")
     parser.add_argument("--manual-text-file", help="Path to a text file created from pasted content.")
-    parser.add_argument("--platforms", default="xiaohongshu,bilibili,zhihu", help="Comma-separated platform keys.")
+    parser.add_argument("--platforms", default="xiaohongshu,douyin,weixin,web", help="Comma-separated platform keys.")
     parser.add_argument("--limit", type=int, default=12, help="Maximum viral candidates to keep.")
     parser.add_argument("--output-dir", help="Explicit output directory.")
     parser.add_argument(
@@ -167,8 +185,14 @@ def discover_candidates(direction, platforms, limit):
         preset = PLATFORM_PRESETS.get(platform_key)
         if not preset:
             continue
-        query = f'{direction} {preset["query_suffix"]}'.strip()
-        all_candidates.extend(fetch_google_news_samples(direction, platform_key, preset["label"], query, per_platform))
+        discovery = preset.get("discovery", "sogou")
+        if discovery == "xiaohongshu":
+            all_candidates.extend(fetch_xiaohongshu_samples(direction, platform_key, preset["label"], per_platform))
+            continue
+        if discovery == "douyin":
+            all_candidates.extend(fetch_douyin_samples(direction, platform_key, preset["label"], per_platform))
+            continue
+        all_candidates.extend(fetch_sogou_samples(direction, platform_key, preset, per_platform))
     ranked = sorted(all_candidates, key=lambda item: item["score"], reverse=True)
     deduped = []
     seen = set()
@@ -181,16 +205,10 @@ def discover_candidates(direction, platforms, limit):
     return deduped[:limit]
 
 
-def fetch_google_news_samples(direction, platform_key, platform_label, query, limit):
-    rss_url = (
-        "https://news.google.com/rss/search?q="
-        + urllib.parse.quote(query)
-        + "&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
-    )
-    req = urllib.request.Request(rss_url, headers={"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9"})
+def fetch_xiaohongshu_samples(direction, platform_key, platform_label, limit):
+    public_feed_url = "https://r.jina.ai/http://www.xiaohongshu.com/explore?channel_id=homefeed_recommend"
     try:
-        with urllib.request.urlopen(req, timeout=20) as response:
-            xml_text = response.read().decode("utf-8", errors="ignore")
+        markdown = fetch_text(public_feed_url)
     except urllib.error.URLError as exc:
         return [{
             "id": create_id("viral"),
@@ -198,22 +216,94 @@ def fetch_google_news_samples(direction, platform_key, platform_label, query, li
             "platform": platform_key,
             "platform_label": platform_label,
             "title": f"{platform_label} 抓取失败",
-            "url": rss_url,
+            "url": public_feed_url,
             "snippet": str(exc),
             "score": 0,
         }]
-
-    root = ET.fromstring(xml_text)
-    channel = root.find("channel")
-    if channel is None:
-        return []
-
     items = []
-    for node in channel.findall("item")[:limit]:
-        title = text_or_empty(node.find("title")).strip()
-        link = text_or_empty(node.find("link")).strip()
-        description = strip_html(text_or_empty(node.find("description")).strip())
-        if not title or not link:
+    seen = set()
+    for title, link in extract_markdown_links(markdown, domain_hint="xiaohongshu.com/explore"):
+        title = cleanup_markdown_text(title)
+        if not title or title.startswith("!") or "channel_id=" in link or "channel_type=" in link:
+            continue
+        relevance = keyword_relevance(direction, title, "小红书 公共推荐流", platform_label)
+        if relevance < 2:
+            continue
+        key = (title, link)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "id": create_id("viral"),
+            "direction": direction,
+            "platform": platform_key,
+            "platform_label": platform_label,
+            "title": title,
+            "url": link,
+            "snippet": "来自小红书公共推荐流的高曝光笔记样本。",
+            "score": score_candidate(direction, title, "小红书 公共推荐流") + relevance,
+        })
+        if len(items) >= limit:
+            break
+    if len(items) >= max(2, min(4, limit)):
+        return items
+    fallback_preset = dict(PLATFORM_PRESETS["xiaohongshu"])
+    fallback_preset["discovery"] = "sogou"
+    fallback_items = fetch_sogou_samples(direction, platform_key, fallback_preset, limit, min_relevance=2)
+    for item in fallback_items:
+        key = (item["title"], item["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_douyin_samples(direction, platform_key, platform_label, limit):
+    items = []
+    seen = set()
+    hot_quota = max(2, limit // 2)
+    for item in fetch_douyin_hot_samples(direction, platform_key, platform_label, hot_quota):
+        key = (item["title"], item["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+    search_quota = max(2, limit - len(items))
+    for item in fetch_douyin_search_samples(direction, platform_key, platform_label, search_quota):
+        key = (item["title"], item["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items[:limit]
+
+
+def fetch_douyin_hot_samples(direction, platform_key, platform_label, limit):
+    hot_url = "https://r.jina.ai/http://www.douyin.com/hot"
+    try:
+        markdown = fetch_text(hot_url)
+    except urllib.error.URLError as exc:
+        return [{
+            "id": create_id("viral"),
+            "direction": direction,
+            "platform": platform_key,
+            "platform_label": platform_label,
+            "title": f"{platform_label} 抓取失败",
+            "url": hot_url,
+            "snippet": str(exc),
+            "score": 0,
+        }]
+    items = []
+    for rank, title, link, heat in extract_douyin_hot_items(markdown):
+        title = cleanup_markdown_text(title)
+        snippet = f"抖音热榜第{rank}名，热度 {heat}。" if heat else f"抖音热榜第{rank}名。"
+        relevance = keyword_relevance(direction, title, snippet, platform_label)
+        if relevance < 1 and contains_noise_keyword(title, platform_label):
             continue
         items.append({
             "id": create_id("viral"),
@@ -222,16 +312,186 @@ def fetch_google_news_samples(direction, platform_key, platform_label, query, li
             "platform_label": platform_label,
             "title": title,
             "url": link,
-            "snippet": description,
-            "score": score_candidate(direction, title, description),
+            "snippet": snippet,
+            "score": score_candidate(direction, title, snippet) + relevance,
+        })
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_douyin_search_samples(direction, platform_key, platform_label, limit):
+    preset = {
+        "label": platform_label,
+        "site_hint": PLATFORM_PRESETS["douyin"].get("site_hint", "site:douyin.com"),
+        "query_suffix": "抖音",
+    }
+    items = fetch_sogou_samples(direction, platform_key, preset, limit, min_relevance=1)
+    for item in items:
+        item["snippet"] = trim(f"{item['snippet']} 渠道：抖音搜索结果。", 180)
+        item["score"] += 1
+    return items
+
+
+def fetch_sogou_samples(direction, platform_key, preset, limit, min_relevance=0):
+    platform_label = preset["label"]
+    items = []
+    seen = set()
+    for query in build_platform_queries(direction, preset)[:3]:
+        search_url = "https://r.jina.ai/http://www.sogou.com/web?query=" + urllib.parse.quote(query)
+        try:
+            markdown = fetch_text(search_url)
+        except urllib.error.URLError:
+            continue
+        for item in extract_sogou_results(markdown, direction, platform_key, platform_label, min_relevance=min_relevance):
+            key = (item["title"], item["url"])
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+            if len(items) >= limit:
+                return items
+    return items
+
+
+def build_platform_queries(direction, preset):
+    queries = []
+    site_hint = preset.get("site_hint", "").strip()
+    suffix = preset.get("query_suffix", "").strip()
+    for variant in build_direction_variants(direction):
+        query = " ".join(part for part in [site_hint, variant, suffix] if part).strip()
+        if query and query not in queries:
+            queries.append(query)
+    return queries or [direction]
+
+
+def build_direction_variants(direction):
+    variants = []
+    base = re.sub(r"\s+", " ", direction).strip()
+    if base:
+        variants.append(base)
+    simplified = base
+    for noise in ["怎么", "如何", "使用", "应用", "场景", "方案", "流程", "方法", "在", "的"]:
+        simplified = simplified.replace(noise, " ")
+    tokens = [token.strip() for token in re.split(r"[\s,，、/|]+", simplified) if token.strip()]
+    if tokens:
+        compact = " ".join(tokens)
+        if compact not in variants:
+            variants.append(compact)
+        if len(tokens) >= 2:
+            combos = [
+                " ".join(tokens[:2]),
+                " ".join(tokens[-2:]),
+                "".join(tokens[:2]),
+            ]
+            for combo in combos:
+                combo = combo.strip()
+                if combo and combo not in variants:
+                    variants.append(combo)
+    return variants
+
+
+def fetch_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+def extract_markdown_links(markdown, domain_hint=""):
+    pattern = re.compile(r"\[([^\]\n]+)\]\((https?://[^\s\)]+)\)")
+    items = []
+    for title, url in pattern.findall(markdown):
+        if domain_hint and domain_hint not in url:
+            continue
+        items.append((title, url))
+    return items
+
+
+def extract_douyin_hot_items(markdown):
+    items = []
+    pattern = re.compile(
+        r"^\*\s+(?:(\d+)|!\[Image[^\]]+\][^\n]*?)\s*### \[([^\]]+)\]\((https?://[^\)]+)\)(?:[^\n]*?(\d+(?:\.\d+)?K)\s*热度)?",
+        re.M,
+    )
+    inferred_rank = 0
+    for raw_rank, title, url, heat in pattern.findall(markdown):
+        inferred_rank += 1
+        rank = raw_rank or str(inferred_rank)
+        items.append((rank, title, url, heat))
+    return items
+
+
+def extract_sogou_results(markdown, direction, platform_key, platform_label, min_relevance=0):
+    heading_pattern = re.compile(r"^### \[([^\]]+)\]\((https?://[^\)]+)\)\s*$", re.M)
+    items = []
+    for match in heading_pattern.finditer(markdown):
+        title = cleanup_markdown_text(match.group(1))
+        url = match.group(2)
+        if should_skip_sogou_title(title):
+            continue
+        if platform_label == "小红书" and should_skip_xiaohongshu_result(title, url):
+            continue
+        following = markdown[match.end():].splitlines()
+        snippet_lines = []
+        for line in following:
+            line = cleanup_markdown_text(line)
+            if not line:
+                if snippet_lines:
+                    break
+                continue
+            if line.startswith("### "):
+                break
+            if line.startswith("[") or line.startswith("!"):
+                continue
+            snippet_lines.append(line)
+            if len(snippet_lines) >= 2:
+                break
+        snippet = trim(" ".join(snippet_lines), 180) or f"来自{platform_label}相关中文搜索结果。"
+        relevance = keyword_relevance(direction, title, snippet, platform_label)
+        if relevance < min_relevance:
+            continue
+        items.append({
+            "id": create_id("viral"),
+            "direction": direction,
+            "platform": platform_key,
+            "platform_label": platform_label,
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "score": score_candidate(direction, title, snippet) + relevance,
         })
     return items
+
+
+def should_skip_sogou_title(title):
+    blacklist = [
+        "在线协议",
+        "高级搜索",
+        "发现",
+        "小红书招聘",
+        "元宝",
+        "Try Visual Search",
+    ]
+    return not title or any(word in title for word in blacklist)
+
+
+def should_skip_xiaohongshu_result(title, url):
+    blacklist = [
+        "专业号登录",
+        "千帆PC端",
+        "电商官网",
+        "商家",
+        "官网",
+    ]
+    if any(word in title for word in blacklist):
+        return True
+    return "xiaohongshu.com/explore" not in url and "sogou.com/link" in url
 
 
 def score_candidate(direction, title, description):
     text = f"{title} {description}"
     score = 0.0
-    for token in re.split(r"\s+", direction):
+    for token in build_direction_variants(direction):
         token = token.strip()
         if token and token.lower() in text.lower():
             score += 2
@@ -239,6 +499,39 @@ def score_candidate(direction, title, description):
         if signal in text:
             score += 1
     return score
+
+
+def keyword_relevance(direction, title, description, platform_label=""):
+    text = cleanup_markdown_text(f"{title} {description}")
+    score = 0.0
+    for token in build_direction_variants(direction):
+        token = token.strip()
+        if not token or len(token) <= 1:
+            continue
+        if token.lower() in text.lower():
+            score += 1.5 if len(token) <= 3 else 2
+    for token in split_direction_keywords(direction):
+        if token and token in text:
+            score += 1
+    if contains_noise_keyword(text, platform_label):
+        score -= 2
+    return score
+
+
+def split_direction_keywords(direction):
+    raw = re.split(r"[\s,，、/|]+", re.sub(r"[^\w\u4e00-\u9fff]+", " ", direction))
+    keywords = []
+    for token in raw:
+        token = token.strip()
+        if len(token) <= 1:
+            continue
+        if token not in keywords:
+            keywords.append(token)
+    return keywords
+
+
+def contains_noise_keyword(text, platform_label):
+    return any(keyword in text for keyword in NOISE_KEYWORDS.get(platform_label, []))
 
 
 def generate_topics(direction, library, candidates, llm_config):
@@ -500,6 +793,13 @@ def write_json(path: Path, payload):
 
 def strip_html(text):
     text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def cleanup_markdown_text(text):
+    text = strip_html(text)
+    text = re.sub(r"!\[[^\]]*\]", " ", text)
+    text = re.sub(r"\[[^\]]+\]\([^\)]+\)", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 

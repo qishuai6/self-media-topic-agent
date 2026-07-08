@@ -23,16 +23,23 @@ python3 /Users/qishuai/.codex/skills/self-media-topic-agent/scripts/run_topic_ag
 python3 /Users/qishuai/.codex/skills/self-media-topic-agent/scripts/run_topic_agent.py \
   --direction "短视频变现" \
   --content-dir /absolute/path/to/content-folder \
-  --platforms xiaohongshu,bilibili,zhihu
+  --platforms xiaohongshu,douyin,weixin,web
 ```
 
 ## 平台键
 
 1. `xiaohongshu`
-2. `bilibili`
-3. `zhihu`
-4. `weixin`
-5. `web`
+2. `douyin`
+3. `bilibili`
+4. `zhihu`
+5. `weixin`
+6. `web`
+
+## 当前抓取层
+
+1. `xiaohongshu`：小红书公共推荐流笔记 + 关键词相关性过滤
+2. `douyin`：抖音热榜 + 搜索结果双通道
+3. `weixin` / `web` / `zhihu` / `bilibili`：搜狗中文搜索结果
 
 ## 模型配置
 
